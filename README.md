@@ -9,6 +9,18 @@ The staking system consists of two main contracts:
 1. `AIXCBLPStaking.sol`: Handles staking of Aerodrome vAMM-aixCB/WETH LP tokens with multi-token rewards
 2. `AIXCBStaking.sol`: Manages staking of AIXCB tokens with multi-token rewards
 
+## Version History
+
+### v2 (Current)
+- Post-audit fixes
+- Removed VIP/loyalty system
+- Removed emergency withdrawals fee
+- Enable unstake when poolPeriod is over
+- Add staking period upgrade
+
+### v1
+- Initial version
+
 ### Key Features
 
 - Multi-token reward system

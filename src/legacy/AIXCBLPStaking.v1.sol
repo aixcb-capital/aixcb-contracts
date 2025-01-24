@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -10,16 +10,25 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
- * @title AIXCBLPStaking v1.1
+ * @title AIXCBLPStaking
  * @notice Staking contract for Aerodrome vAMM-aixCB/WETH LP tokens with multi-token rewards
  * @dev Implements upgradeable pattern with UUPS proxy
- *
- * Changes from v1:
- * - Removed loyalty/VIP tracking functionality
- * - Added reward token decimal validation
- * - Locked compiler version
- * - Fixed naming convention issues
- * - Maintained storage layout for upgrade compatibility
+ * 
+ * This contract allows users to:
+ * - Stake Aerodrome LP tokens
+ * - Earn multiple reward tokens
+ * - Track loyalty and VIP status
+ * - Monitor staking metrics
+ * - Withdraw stakes at any time
+ * - Claim rewards independently
+ * 
+ * Security features:
+ * - Emergency mode with admin controls
+ * - Circuit breakers for critical functions
+ * - Role-based access control
+ * - Reentrancy protection
+ * 
+ * @custom:security-contact security@aixcb.com
  */
 contract AIXCBLPStaking is
     ReentrancyGuardUpgradeable,
@@ -87,12 +96,11 @@ contract AIXCBLPStaking is
 
     /// @notice State variables for staking and rewards
     mapping(address => UserStake) public userStakes;
-
-    // Kept for storage layout compatibility - do not use
     mapping(address => LoyaltyStats) public loyaltyStats;
     uint256 public totalStakedAmount;
 
     // ============ Events ============
+
     event StakeDeposited(address indexed user, uint256 amount, uint256 timestamp);
     event StakeWithdrawn(address indexed user, uint256 amount, uint256 timestamp);
     event RewardsClaimed(address indexed user, address indexed token, uint256 amount, uint256 timestamp);
@@ -106,12 +114,21 @@ contract AIXCBLPStaking is
     event EmergencyModeActivated(uint256 timestamp);
     event EmergencyModeDeactivated(uint256 timestamp);
     event CircuitBreakerToggled(bytes32 indexed circuit, bool status, uint256 timestamp);
+    event LoyaltyMetrics(
+        address indexed user,
+        uint256 stakingPower,
+        uint256 currentStreak,
+        uint256 totalStakingDays,
+        uint256 engagementScore,
+        uint256 timestamp
+    );
     event RewardTokenAdded(address indexed token, uint256 timestamp);
     event EmergencyWithdraw(address indexed user, uint256 amount, uint256 fee, uint256 timestamp);
     event RewardTokenRemoved(address indexed token, uint256 timestamp);
     event Recovered(address indexed token, uint256 amount, uint256 timestamp);
 
     // ============ Errors ============
+
     error ZeroAmount();
     error InsufficientRewards();
     error NoStakeFound();
@@ -126,7 +143,6 @@ contract AIXCBLPStaking is
     error CannotRecoverRewardToken();
     error TokenNotRewardToken();
     error HasPendingRewards();
-    error InvalidDecimals();
 
     // ============ Modifiers ============
 
@@ -195,21 +211,21 @@ contract AIXCBLPStaking is
     /// @notice Stakes LP tokens to earn rewards
     /// @param amount Amount of LP tokens to stake
     /// @dev Reverts if amount is 0 or exceeds max stake amount
-    function stake(uint256 amount)
-        external
-        nonReentrant
-        whenNotPaused
-        notInEmergencyMode
-        circuitBreakerNotActive(STAKING_CIRCUIT)
+    function stake(uint256 amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+        notInEmergencyMode 
+        circuitBreakerNotActive(STAKING_CIRCUIT) 
     {
         if (amount == 0) revert ZeroAmount();
-
+        
         UserStake storage userStake = userStakes[msg.sender];
         uint256 newTotalStake = uint256(userStake.stakedAmount) + amount;
         if (newTotalStake > MAX_STAKE_AMOUNT) revert ExceedsMaxStake();
 
         _updateRewards(msg.sender);
-
+        
         // If user already has a stake, claim pending rewards first
         if (userStake.stakedAmount > 0) {
             _claimRewards(msg.sender);
@@ -217,7 +233,7 @@ contract AIXCBLPStaking is
 
         totalStakedAmount += amount;
         userStake.stakedAmount = uint128(newTotalStake);
-        userStake.initialStakeTime = userStake.initialStakeTime == 0 ?
+        userStake.initialStakeTime = userStake.initialStakeTime == 0 ? 
             uint48(block.timestamp) : userStake.initialStakeTime;
         userStake.lastUpdateTime = uint48(block.timestamp);
 
@@ -228,18 +244,21 @@ contract AIXCBLPStaking is
         }
 
         lpToken.safeTransferFrom(msg.sender, address(this), amount);
+
+        _updateLoyaltyMetrics(msg.sender, amount, true);
+
         emit StakeDeposited(msg.sender, amount, block.timestamp);
     }
 
     /// @notice Withdraws staked LP tokens and claims rewards
     /// @param amount Amount of LP tokens to withdraw
     /// @dev Reverts if amount is 0 or exceeds staked amount
-    function withdraw(uint256 amount)
-        external
-        nonReentrant
-        whenNotPaused
+    function withdraw(uint256 amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
         notInEmergencyMode
-        circuitBreakerNotActive(WITHDRAW_CIRCUIT)
+        circuitBreakerNotActive(WITHDRAW_CIRCUIT) 
     {
         UserStake storage userStake = userStakes[msg.sender];
         if (userStake.stakedAmount == 0) revert NoStakeFound();
@@ -260,17 +279,20 @@ contract AIXCBLPStaking is
         }
 
         lpToken.safeTransfer(msg.sender, amount);
+
+        _updateLoyaltyMetrics(msg.sender, amount, false);
+
         emit StakeWithdrawn(msg.sender, amount, block.timestamp);
     }
 
     /// @notice Claims pending rewards for all reward tokens
     /// @dev Reverts if no rewards are available
-    function claimRewards()
-        external
-        nonReentrant
-        whenNotPaused
+    function claimRewards() 
+        external 
+        nonReentrant 
+        whenNotPaused 
         notInEmergencyMode
-        circuitBreakerNotActive(REWARD_CIRCUIT)
+        circuitBreakerNotActive(REWARD_CIRCUIT) 
     {
         _updateRewards(msg.sender);
         _claimRewards(msg.sender);
@@ -301,11 +323,11 @@ contract AIXCBLPStaking is
 
     /// @notice Adds a new reward token
     /// @param token Address of the reward token to add
-    function addRewardToken(address token)
-        external
-        onlyRole(REWARD_MANAGER_ROLE)
-        whenNotPaused
-        nonReentrant
+    function addRewardToken(address token) 
+        external 
+        onlyRole(REWARD_MANAGER_ROLE) 
+        whenNotPaused 
+        nonReentrant 
     {
         _addRewardToken(token);
     }
@@ -323,7 +345,7 @@ contract AIXCBLPStaking is
         if (amount == 0) revert ZeroAmount();
 
         RewardPool storage pool = rewardPools[token];
-
+        
         // Update rewards before modifying the pool
         _updateRewardPool(token);
 
@@ -352,7 +374,7 @@ contract AIXCBLPStaking is
     /// @param token Address of the reward token
     function _updateRewardPool(address token) internal {
         RewardPool storage pool = rewardPools[token];
-
+        
         if (totalStakedAmount == 0) {
             pool.lastUpdateTimestamp = block.timestamp;
             return;
@@ -383,11 +405,11 @@ contract AIXCBLPStaking is
 
         RewardPool storage pool = rewardPools[token];
         uint256 pending = (uint256(userStake.stakedAmount) * pool.accumulatedPerShare) / PRECISION - userStake.rewardDebt[token];
-
+        
         if (pending > 0) {
             uint256 remainingRewards = pool.totalRewardAmount - pool.totalDistributedAmount;
             uint256 transferAmount = pending > remainingRewards ? remainingRewards : pending;
-
+            
             if (transferAmount > 0) {
                 pool.totalDistributedAmount += transferAmount;
                 IERC20Metadata(token).safeTransfer(account, transferAmount);
@@ -404,6 +426,58 @@ contract AIXCBLPStaking is
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             _updateUserRewards(account, rewardTokens[i]);
         }
+    }
+
+    /// @notice Updates loyalty metrics for a user
+    /// @param user Address of the user
+    /// @param amount Amount of tokens involved
+    /// @param isStaking Whether the operation is staking (true) or withdrawing (false)
+    function _updateLoyaltyMetrics(address user, uint256 amount, bool isStaking) internal {
+        LoyaltyStats storage stats = loyaltyStats[user];
+        uint256 currentTime = block.timestamp;
+
+        if (isStaking) {
+            stats.stakingPower += amount;
+            
+            if (stats.lastUpdateTime == 0) {
+                stats.currentStreak = 1;
+                stats.totalStakingDays = 1;
+            } else {
+                uint256 daysSinceLastUpdate = (currentTime - stats.lastUpdateTime) / 1 days;
+                if (daysSinceLastUpdate >= 1) {
+                    stats.currentStreak++;
+                    if (stats.currentStreak > stats.longestStreak) {
+                        stats.longestStreak = stats.currentStreak;
+                    }
+                    stats.totalStakingDays += daysSinceLastUpdate;
+                } else if (daysSinceLastUpdate > 1) {
+                    stats.currentStreak = 1;
+                    stats.totalStakingDays += daysSinceLastUpdate;
+                }
+            }
+        } else {
+            stats.stakingPower = stats.stakingPower > amount ? stats.stakingPower - amount : 0;
+        }
+
+        stats.lastUpdateTime = currentTime;
+        stats.engagementScore = _calculateEngagementScore(user);
+
+        emit LoyaltyMetrics(
+            user,
+            stats.stakingPower,
+            stats.currentStreak,
+            stats.totalStakingDays,
+            stats.engagementScore,
+            currentTime
+        );
+    }
+
+    /// @notice Calculates engagement score for a user
+    /// @param user Address of the user
+    /// @return Calculated engagement score
+    function _calculateEngagementScore(address user) internal view returns (uint256) {
+        LoyaltyStats storage stats = loyaltyStats[user];
+        return (stats.stakingPower * stats.totalStakingDays * (100 + stats.currentStreak)) / 100;
     }
 
     // ============ View Functions ============
@@ -458,6 +532,33 @@ contract AIXCBLPStaking is
         );
     }
 
+    /// @notice Gets loyalty statistics for a user
+    /// @param user Address of the user
+    /// @return stakingPower Current staking power of the user
+    /// @return currentStreak Current consecutive staking streak in days
+    /// @return longestStreak Longest staking streak achieved
+    /// @return totalDays Total number of days staked
+    /// @return lastUpdate Last time loyalty metrics were updated
+    /// @return engagement Current engagement score
+    function getLoyaltyStats(address user) external view returns (
+        uint256 stakingPower,
+        uint256 currentStreak,
+        uint256 longestStreak,
+        uint256 totalDays,
+        uint256 lastUpdate,
+        uint256 engagement
+    ) {
+        LoyaltyStats storage stats = loyaltyStats[user];
+        return (
+            stats.stakingPower,
+            stats.currentStreak,
+            stats.longestStreak,
+            stats.totalStakingDays,
+            stats.lastUpdateTime,
+            stats.engagementScore
+        );
+    }
+
     // ============ Emergency Functions ============
 
     /// @notice Activates emergency mode
@@ -496,7 +597,6 @@ contract AIXCBLPStaking is
     function _addRewardToken(address token) internal {
         require(token != address(0), "Invalid token address");
         require(!isRewardToken[token], "Token already added");
-        if (IERC20Metadata(token).decimals() != 18) revert InvalidDecimals();
 
         isRewardToken[token] = true;
         rewardTokens.push(token);
@@ -506,14 +606,14 @@ contract AIXCBLPStaking is
     /// @notice Removes a reward token from the contract
     /// @dev Only callable by admin role. Ensures all rewards are distributed before removal
     /// @param token Address of the reward token to remove
-    function removeRewardToken(address token)
-        external
-        onlyRole(ADMIN_ROLE)
-        whenNotPaused
-        nonReentrant
+    function removeRewardToken(address token) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+        whenNotPaused 
+        nonReentrant 
     {
         if (!isRewardToken[token]) revert TokenNotRewardToken();
-
+        
         // Check for pending rewards
         RewardPool storage pool = rewardPools[token];
         if (pool.totalRewardAmount > pool.totalDistributedAmount) revert HasPendingRewards();
@@ -540,18 +640,18 @@ contract AIXCBLPStaking is
     /// @dev Only callable by admin role. Cannot recover LP tokens or active reward tokens
     /// @param tokenAddress Address of the token to recover
     /// @param tokenAmount Amount of tokens to recover
-    function recoverERC20(address tokenAddress, uint256 tokenAmount)
-        external
-        onlyRole(ADMIN_ROLE)
-        nonReentrant
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+        nonReentrant 
     {
         if (tokenAddress == address(lpToken)) revert CannotRecoverLPToken();
         if (isRewardToken[tokenAddress]) revert CannotRecoverRewardToken();
-
+        
         IERC20Metadata(tokenAddress).safeTransfer(treasury, tokenAmount);
-
+        
         emit Recovered(tokenAddress, tokenAmount, block.timestamp);
     }
 
     uint256[50] private __gap;
-}
+} 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -28,11 +28,8 @@ contract AIXCBStaking is
 
     uint256 private constant PRECISION = 1e18;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
-
-    // Kept for storage compatibility (not used in logic)
     uint256 private constant EMERGENCY_WITHDRAW_FEE = 2000;
     uint256[] public lockPeriods;
-    // Kept for storage compatibility (not used in logic)
     uint256[] public PERIOD_RATES;
     uint256 public constant MAX_PERIOD_INDEX = 2;
 
@@ -50,9 +47,7 @@ contract AIXCBStaking is
     mapping(address => mapping(uint256 => mapping(address => uint256))) public userRewardPerSharePaid;
     mapping(address => mapping(uint256 => mapping(address => uint256))) public userRewards;
 
-    // Kept for storage compatibility (not used in logic)
     mapping(address => LoyaltyStats) public loyaltyStats;
-    // Kept for storage compatibility (not used in logic)
     mapping(address => bool) public isVIP;
 
     mapping(bytes32 => bool) public circuitBreakers;
@@ -83,6 +78,48 @@ contract AIXCBStaking is
     /// @param amount Amount of rewards paid
     /// @param periodIndex Index of the staking period
     event RewardPaid(address indexed user, address indexed token, uint256 amount, uint256 periodIndex);
+
+    /// @notice Emitted when staking activity occurs
+    /// @param user Address of the user
+    /// @param amount Amount of tokens involved
+    /// @param periodIndex Index of the staking period
+    /// @param startTime Start timestamp
+    /// @param endTime End timestamp
+    /// @param isNewStake Whether this is a new stake or withdrawal
+    /// @param totalUserStake Updated total stake of the user
+    /// @param stakingPower Updated staking power
+    event StakingActivity(
+        address indexed user,
+        uint256 amount,
+        uint256 periodIndex,
+        uint256 startTime,
+        uint256 endTime,
+        bool isNewStake,
+        uint256 totalUserStake,
+        uint256 stakingPower
+    );
+
+    /// @notice Emitted when loyalty metrics are updated
+    /// @param user Address of the user
+    /// @param stakingPower Updated staking power
+    /// @param currentStreak Current staking streak
+    /// @param totalStakingDays Total days staked
+    /// @param engagementScore Updated engagement score
+    /// @param timestamp Time of the update
+    event LoyaltyMetrics(
+        address indexed user,
+        uint256 stakingPower,
+        uint256 currentStreak,
+        uint256 totalStakingDays,
+        uint256 engagementScore,
+        uint256 timestamp
+    );
+
+    /// @notice Emitted when a user's VIP status changes
+    /// @param user Address of the user
+    /// @param status New VIP status
+    /// @param totalStake Total stake amount that triggered the change
+    event VIPStatusChanged(address indexed user, bool status, uint256 totalStake);
 
     /// @notice Emitted when a circuit breaker is toggled
     /// @param circuit Identifier of the circuit
@@ -121,25 +158,6 @@ contract AIXCBStaking is
     /// @param timestamp Timestamp of the recovery
     event Recovered(address indexed token, uint256 amount, uint256 timestamp);
 
-    /// @notice Emitted when a new reward token is added to the contract
-    /// @param token Address of the added reward token
-    /// @param timestamp Timestamp of the addition
-    event RewardTokenAdded(address indexed token, uint256 timestamp);
-
-    /// @notice Emitted when a user upgrades their stake to a longer lock period
-    /// @param user Address of the user upgrading the stake
-    /// @param oldPeriodIndex Original staking period index
-    /// @param newPeriodIndex New staking period index
-    /// @param amount Amount of tokens being upgraded
-    /// @param timestamp Time of the upgrade
-    event StakeUpgraded(
-        address indexed user,
-        uint256 oldPeriodIndex,
-        uint256 newPeriodIndex,
-        uint256 amount,
-        uint256 timestamp
-    );
-
     error DeadlineExpired();
     error ZeroAmount();
     error InvalidPeriod();
@@ -155,7 +173,6 @@ contract AIXCBStaking is
     error CannotRecoverRewardToken();
     error TokenNotRewardToken();
     error HasPendingRewards();
-    error InvalidUpgradePath();
 
     /// @notice Represents a user's stake in a specific period
     /// @dev Packed into a single storage slot
@@ -177,11 +194,13 @@ contract AIXCBStaking is
         uint256 rewardRate;
     }
 
+
     /// @notice Parameters for staking operation
     struct StakeParams {
         uint256 amount;
         uint256 periodIndex;
         uint256 deadline;
+        uint256 minRate;
     }
 
     /// @notice Tracks user loyalty and engagement metrics
@@ -219,7 +238,7 @@ contract AIXCBStaking is
         _grantRole(REWARD_MANAGER_ROLE, msg.sender);
 
         lockPeriods = [90 days, 180 days, 360 days];
-        // periodRates initialized but unused for backward compatibility
+        PERIOD_RATES = [200, 600, 1000];
 
         for (uint256 i = 0; i < _initialRewardTokens.length; i++) {
             _addRewardToken(_initialRewardTokens[i]);
@@ -239,23 +258,20 @@ contract AIXCBStaking is
     /// @param token Address of the reward token to add
     function _addRewardToken(address token) internal {
         require(token != address(0), "Invalid token address");
-        require(IERC20Metadata(token).decimals() == 18, "Invalid token decimals");
-
         if (!isRewardToken[token]) {
             rewardTokens.push(token);
             isRewardToken[token] = true;
-            emit RewardTokenAdded(token, block.timestamp);
         }
     }
 
     /// @notice Adds a new reward token to the accepted list
     /// @dev Can only be called by accounts with REWARD_MANAGER_ROLE
     /// @param token Address of the reward token to add
-    function addRewardToken(address token)
-        external
-        onlyRole(REWARD_MANAGER_ROLE)
-        whenNotPaused
-        nonReentrant
+    function addRewardToken(address token) 
+        external 
+        onlyRole(REWARD_MANAGER_ROLE) 
+        whenNotPaused 
+        nonReentrant 
     {
         _addRewardToken(token);
     }
@@ -268,10 +284,10 @@ contract AIXCBStaking is
         whenNotPaused
         notEmergency
         whenCircuitActive(STAKING_CIRCUIT)
-        validPeriod(params.periodIndex)
-        validAmount(params.amount)
     {
         if (block.timestamp > params.deadline) revert DeadlineExpired();
+        if (params.amount == 0) revert ZeroAmount();
+        if (params.periodIndex > MAX_PERIOD_INDEX) revert InvalidPeriod();
 
         UserStake storage userStake = userStakes[msg.sender][params.periodIndex];
         uint256 endTime;
@@ -304,6 +320,8 @@ contract AIXCBStaking is
 
         stakingToken.safeTransferFrom(msg.sender, address(this), params.amount);
 
+        _updateLoyaltyMetrics(msg.sender, params.amount, params.periodIndex, true);
+
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
             RewardPool storage pool = rewardPools[params.periodIndex][token];
@@ -311,6 +329,16 @@ contract AIXCBStaking is
         }
 
         emit Staked(msg.sender, params.amount, params.periodIndex, block.timestamp, endTime);
+        emit StakingActivity(
+            msg.sender,
+            params.amount,
+            params.periodIndex,
+            block.timestamp,
+            endTime,
+            true,
+            _totalUserStake[msg.sender],
+            _calculateStakingPower(params.amount, params.periodIndex)
+        );
     }
 
     /// @notice Withdraws staked tokens after lock period expires
@@ -321,36 +349,21 @@ contract AIXCBStaking is
         whenNotPaused
         notEmergency
         whenCircuitActive(WITHDRAWAL_CIRCUIT)
-        validPeriod(periodIndex)
     {
         UserStake storage userStakeData = userStakes[msg.sender][periodIndex];
         if (!userStakeData.initialized) revert StakeNotFound();
-
-        // Allow withdrawal if either lock period ended OR all reward pools finished
-        if (block.timestamp < userStakeData.endTime && !isAllRewardPoolsFinished(periodIndex)) {
-            revert StakeLocked();
-        }
+        if (block.timestamp < userStakeData.endTime) revert StakeLocked();
 
         _updateReward(msg.sender, periodIndex);
-
-        // Optimize reward claims loop
-        uint256 rewardTokenLength = rewardTokens.length;
-        for (uint256 i = 0; i < rewardTokenLength; i++) {
+        for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
-
             uint256 reward = userRewards[msg.sender][periodIndex][token];
             if (reward > 0) {
-                uint256 contractBalance = IERC20Metadata(token).balanceOf(address(this));
-                uint256 transferAmount = Math.min(reward, contractBalance);
-
-                if (transferAmount > 0) {
-                    userRewards[msg.sender][periodIndex][token] -= transferAmount;
-                    RewardPool storage pool = rewardPools[periodIndex][token];
-                    pool.totalDistributed += transferAmount;
-
-                    IERC20Metadata(token).safeTransfer(msg.sender, transferAmount);
-                    emit RewardPaid(msg.sender, token, transferAmount, periodIndex);
-                }
+                userRewards[msg.sender][periodIndex][token] = 0;
+                RewardPool storage pool = rewardPools[periodIndex][token];
+                pool.totalDistributed += reward;
+                IERC20Metadata(token).safeTransfer(msg.sender, reward);
+                emit RewardPaid(msg.sender, token, reward, periodIndex);
             }
         }
 
@@ -360,11 +373,22 @@ contract AIXCBStaking is
 
         delete userStakes[msg.sender][periodIndex];
 
-        // Token transfer after state updates
         stakingToken.safeTransfer(msg.sender, amount);
+
+        _updateLoyaltyMetrics(msg.sender, amount, periodIndex, false);
 
         uint256 stakeDuration = block.timestamp - userStakeData.startTime;
         emit Withdrawn(msg.sender, amount, periodIndex, stakeDuration);
+        emit StakingActivity(
+            msg.sender,
+            amount,
+            periodIndex,
+            userStakeData.startTime,
+            userStakeData.endTime,
+            false,
+            _totalUserStake[msg.sender],
+            _calculateStakingPower(amount, periodIndex)
+        );
     }
 
     /// @notice Claims accumulated rewards for a specific staking period
@@ -375,28 +399,41 @@ contract AIXCBStaking is
         whenNotPaused
         notEmergency
         whenCircuitActive(REWARDS_CIRCUIT)
-        validPeriod(periodIndex)
     {
+        if (periodIndex > MAX_PERIOD_INDEX) revert InvalidPeriod();
+        
         _updateReward(msg.sender, periodIndex);
-
+        
+        uint256[] memory rewardAmounts = new uint256[](rewardTokens.length);
+        address[] memory tokensToTransfer = new address[](rewardTokens.length);
+        uint256 validTokenCount = 0;
+        
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
             uint256 reward = userRewards[msg.sender][periodIndex][token];
-
+            
             if (reward > 0) {
-                uint256 balance = IERC20Metadata(token).balanceOf(address(this));
-                uint256 transferAmount = Math.min(reward, balance);
-
-                if (transferAmount > 0) {
-                    userRewards[msg.sender][periodIndex][token] -= transferAmount;
-                    RewardPool storage pool = rewardPools[periodIndex][token];
-                    pool.totalDistributed += transferAmount;
-
-                    IERC20Metadata(token).safeTransfer(msg.sender, transferAmount);
-                    emit RewardPaid(msg.sender, token, transferAmount, periodIndex);
-                }
-
+                userRewards[msg.sender][periodIndex][token] = 0;
+                RewardPool storage pool = rewardPools[periodIndex][token];
+                pool.totalDistributed += reward;
+                
+                rewardAmounts[validTokenCount] = reward;
+                tokensToTransfer[validTokenCount] = token;
+                validTokenCount++;
             }
+        }
+        
+        for (uint256 i = 0; i < validTokenCount; i++) {
+            address token = tokensToTransfer[i];
+            uint256 amount = rewardAmounts[i];
+            
+            require(
+                IERC20Metadata(token).balanceOf(address(this)) >= amount,
+                "Insufficient reward balance"
+            );
+            
+            IERC20Metadata(token).safeTransfer(msg.sender, amount);
+            emit RewardPaid(msg.sender, token, amount, periodIndex);
         }
     }
 
@@ -404,29 +441,35 @@ contract AIXCBStaking is
     /// @param account User address to update rewards for
     /// @param periodIndex Index of the staking period
     function _updateReward(address account, uint256 periodIndex) internal {
-        uint256 totalStaked = totalStakedForPeriod[periodIndex];
-
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
             RewardPool storage pool = rewardPools[periodIndex][token];
+            uint256 totalStaked = totalStakedForPeriod[periodIndex];
 
-            uint256 lastTimeRewardApplicable = Math.min(block.timestamp, pool.periodFinish);
-            uint256 timeDelta = lastTimeRewardApplicable - pool.lastUpdateTime;
+            uint256 lastTimeRewardApplicable = block.timestamp < pool.periodFinish 
+                ? block.timestamp 
+                : pool.periodFinish;
 
-            if (timeDelta > 0 && totalStaked > 0) {
-                // Simplified calculation
+            if (totalStaked > 0 && lastTimeRewardApplicable > pool.lastUpdateTime) {
+                uint256 timeDelta = lastTimeRewardApplicable - pool.lastUpdateTime;
                 uint256 rewardForPeriod = timeDelta * pool.rewardRate;
-                pool.accumulatedPerShare += (rewardForPeriod * PRECISION) / totalStaked;
+                uint256 rewardPerTokenStored = pool.accumulatedPerShare;
+                rewardPerTokenStored += (rewardForPeriod * PRECISION) / totalStaked;
+                pool.accumulatedPerShare = rewardPerTokenStored;
                 pool.lastUpdateTime = lastTimeRewardApplicable;
             }
 
-            // Update user rewards if needed
             if (account != address(0)) {
                 UserStake storage userStakeData = userStakes[account][periodIndex];
                 if (userStakeData.initialized) {
-                    uint256 userRewardDelta = (userStakeData.amount *
-                        (pool.accumulatedPerShare - userRewardPerSharePaid[account][periodIndex][token])) / PRECISION;
-                    userRewards[account][periodIndex][token] += userRewardDelta;
+                    uint256 userStakedAmount = userStakeData.amount;
+                    uint256 accountRewardPerTokenPaid = userRewardPerSharePaid[account][periodIndex][token];
+                    uint256 rewardsAccrued = userRewards[account][periodIndex][token];
+                    
+                    uint256 rewardPerTokenDiff = pool.accumulatedPerShare - accountRewardPerTokenPaid;
+                    uint256 newReward = (userStakedAmount * rewardPerTokenDiff) / PRECISION;
+                    
+                    userRewards[account][periodIndex][token] = rewardsAccrued + newReward;
                     userRewardPerSharePaid[account][periodIndex][token] = pool.accumulatedPerShare;
                 }
             }
@@ -441,26 +484,94 @@ contract AIXCBStaking is
         external
         nonReentrant
         onlyRole(REWARD_MANAGER_ROLE)
-        validPeriod(periodIndex)
-        validRewardToken(token)
-        validAmount(amount)
     {
+        require(isRewardToken[token], "Token not accepted as reward");
+        require(periodIndex <= MAX_PERIOD_INDEX, "Invalid period index");
+        require(amount > 0, "Amount must be greater than zero");
+
         RewardPool storage pool = rewardPools[periodIndex][token];
         _updateReward(address(0), periodIndex);
 
+        pool.rewardRate = amount / SECONDS_PER_YEAR;  // Raw tokens per second, no scaling needed
+        pool.lastUpdateTime = block.timestamp;
+        pool.periodFinish = block.timestamp + SECONDS_PER_YEAR;  // Rewards distributed over a year
+
         IERC20Metadata(token).safeTransferFrom(msg.sender, address(this), amount);
         pool.totalReward += amount;
+    }
 
-        if (block.timestamp >= pool.periodFinish) {
-            pool.rewardRate = amount / SECONDS_PER_YEAR;
-            pool.periodFinish = block.timestamp + SECONDS_PER_YEAR;
+
+    /// @notice Updates user loyalty metrics after staking or withdrawal
+    /// @dev Updates staking power, streaks, and VIP status
+    /// @param user Address of the user
+    /// @param amount Token amount involved
+    /// @param periodIndex Staking period index
+    /// @param isNewStake True if staking, false if withdrawing
+    function _updateLoyaltyMetrics(
+        address user,
+        uint256 amount,
+        uint256 periodIndex,
+        bool isNewStake
+    ) internal {
+        LoyaltyStats storage stats = loyaltyStats[user];
+
+        uint256 stakingPower = _calculateStakingPower(amount, periodIndex);
+        stats.stakingPower = isNewStake ? stats.stakingPower + stakingPower : stats.stakingPower - stakingPower;
+
+        if (isNewStake) {
+            stats.currentStreak++;
+            stats.longestStreak = Math.max(stats.currentStreak, stats.longestStreak);
+            stats.totalStakingDays += lockPeriods[periodIndex] / 1 days;
         } else {
-            uint256 remaining = pool.periodFinish - block.timestamp;
-            uint256 leftover = remaining * pool.rewardRate;
-            pool.rewardRate = (leftover + amount) / remaining;
+            stats.currentStreak = 0;
         }
 
-        pool.lastUpdateTime = block.timestamp;
+        stats.engagementScore = _calculateEngagementScore(user);
+        stats.lastUpdateTime = block.timestamp;
+
+        _updateVIPStatus(user);
+
+        emit LoyaltyMetrics(
+            user,
+            stats.stakingPower,
+            stats.currentStreak,
+            stats.totalStakingDays,
+            stats.engagementScore,
+            block.timestamp
+        );
+    }
+
+    /// @notice Calculates staking power based on amount and period
+    /// @dev Power increases with longer staking periods
+    /// @param amount Amount of tokens staked
+    /// @param periodIndex Index of the staking period
+    /// @return Calculated staking power with period multiplier applied
+    function _calculateStakingPower(uint256 amount, uint256 periodIndex) internal pure returns (uint256) {
+        uint256 periodMultiplier = 100 + (periodIndex * 50);
+        return (amount * periodMultiplier) / 100;
+    }
+
+    /// @notice Calculates user engagement score
+    /// @dev Score is based on staking power and total staking duration
+    /// @param user Address of the user
+    /// @return Calculated engagement score
+    function _calculateEngagementScore(address user) internal view returns (uint256) {
+        LoyaltyStats storage stats = loyaltyStats[user];
+        return stats.stakingPower * stats.totalStakingDays;
+    }
+
+    /// @notice Updates user's VIP status based on total stake
+    /// @dev VIP status threshold is 1,000,000 tokens
+    /// @param user Address of the user to update
+    function _updateVIPStatus(address user) internal {
+        uint256 totalStake = _totalUserStake[user];
+        bool wasVIP = isVIP[user];
+        bool nowVIP = totalStake >= 1_000_000 * 1e18;
+
+        if (nowVIP != wasVIP) {
+            isVIP[user] = nowVIP;
+            emit VIPStatusChanged(user, nowVIP, totalStake);
+        }
     }
 
     /// @notice Toggles circuit breaker for emergency controls
@@ -495,14 +606,11 @@ contract AIXCBStaking is
         address token,
         uint256 amount,
         address recipient
-    ) external
-        nonReentrant
-        onlyRole(EMERGENCY_ADMIN_ROLE)
-        validRewardToken(token)
-        validAmount(amount)
-    {
+    ) external nonReentrant onlyRole(EMERGENCY_ADMIN_ROLE) {
         require(emergencyMode, "Not in emergency mode");
+        require(isRewardToken[token], "Not a reward token");
         require(recipient != address(0), "Invalid recipient");
+        require(amount > 0, "Amount must be greater than 0");
 
         IERC20Metadata(token).safeTransfer(recipient, amount);
 
@@ -510,6 +618,7 @@ contract AIXCBStaking is
     }
 
     /// @notice Allows emergency withdrawal with fee
+    /// @dev 20% fee is sent to treasury
     /// @param periodIndex Index of the staking period to withdraw from
     /// @custom:security nonReentrant
     function emergencyWithdraw(uint256 periodIndex) external nonReentrant {
@@ -518,17 +627,21 @@ contract AIXCBStaking is
         if (!userStakeData.initialized) revert StakeNotFound();
 
         uint256 amount = userStakeData.amount;
+        uint256 fee = (amount * EMERGENCY_WITHDRAW_FEE) / 10000;
+        uint256 withdrawAmount = amount - fee;
 
-        // Update state before transfers
         totalStakedForPeriod[periodIndex] -= amount;
         _totalUserStake[msg.sender] -= amount;
+
         delete userStakes[msg.sender][periodIndex];
 
-        // Transfer full amount to user (no fee)
-        stakingToken.safeTransfer(msg.sender, amount);
+        _updateLoyaltyMetrics(msg.sender, amount, periodIndex, false);
+        
+        stakingToken.safeTransfer(msg.sender, withdrawAmount);
 
-        // Emit event with zero fee
-        emit EmergencyWithdraw(msg.sender, amount, 0, block.timestamp);
+        stakingToken.safeTransfer(treasury, fee);
+
+        emit EmergencyWithdraw(msg.sender, withdrawAmount, fee, block.timestamp);
     }
 
     /// @notice Gets user stake information
@@ -565,11 +678,7 @@ contract AIXCBStaking is
     /// @param periodIndex Index of the staking period
     /// @param token Address of the reward token
     /// @return Amount of pending rewards
-    function pendingRewards(address user, uint256 periodIndex, address token)
-        external
-        view
-        returns (uint256)
-    {
+    function pendingRewards(address user, uint256 periodIndex, address token) external view returns (uint256) {
         RewardPool storage pool = rewardPools[periodIndex][token];
         UserStake storage userStakeData = userStakes[user][periodIndex];
         if (!userStakeData.initialized) {
@@ -579,8 +688,7 @@ contract AIXCBStaking is
         uint256 accumulatedPerShare = pool.accumulatedPerShare;
         uint256 totalStaked = totalStakedForPeriod[periodIndex];
 
-        uint256 lastTimeRewardApplicable = block.timestamp < pool.periodFinish ?
-                                            block.timestamp : pool.periodFinish;
+        uint256 lastTimeRewardApplicable = block.timestamp < pool.periodFinish ? block.timestamp : pool.periodFinish;
 
         if (totalStaked > 0 && pool.lastUpdateTime < lastTimeRewardApplicable) {
             uint256 timeDiff = lastTimeRewardApplicable - pool.lastUpdateTime;
@@ -623,21 +731,11 @@ contract AIXCBStaking is
         _;
     }
 
-    /// @notice Validates if token is an accepted reward token
-    modifier validRewardToken(address token) {
-        if (!isRewardToken[token]) revert TokenNotRewardToken();
-        _;
-    }
-
-    /// @notice Validates period index is within bounds
-    modifier validPeriod(uint256 periodIndex) {
-        if (periodIndex > MAX_PERIOD_INDEX) revert InvalidPeriod();
-        _;
-    }
-
-    /// @notice Validates amount is greater than zero
-    modifier validAmount(uint256 amount) {
-        if (amount == 0) revert ZeroAmount();
+    /// @notice Restricts function access to VIP users
+    modifier onlyVIP() {
+        if (!isVIP[msg.sender]) {
+            revert NotVIP();
+        }
         _;
     }
 
@@ -700,11 +798,7 @@ contract AIXCBStaking is
     /// @param periodIndex Index of the staking period
     /// @param token Address of the reward token
     /// @return Current reward rate per second
-    function getRewardRate(uint256 periodIndex, address token)
-        external view
-        validRewardToken(token)
-        returns (uint256)
-    {
+    function getRewardRate(uint256 periodIndex, address token) external view returns (uint256) {
         require(periodIndex <= MAX_PERIOD_INDEX, "Invalid period index");
         require(isRewardToken[token], "Token not accepted as reward");
         return rewardPools[periodIndex][token].rewardRate;
@@ -718,24 +812,22 @@ contract AIXCBStaking is
     /// @return periodFinish Timestamp when reward distribution ends
     /// @return totalDistributed Total amount of rewards distributed so far
     /// @return remainingRewards Remaining undistributed rewards in the pool
-    function getRewardPoolInfo(uint256 periodIndex, address token)
-        external
-        view
-        validRewardToken(token)
-        returns (
-            uint256 totalReward,
-            uint256 rewardRate,
-            uint256 periodFinish,
-            uint256 totalDistributed,
-            uint256 remainingRewards
-        )
-    {
+    function getRewardPoolInfo(
+        uint256 periodIndex,
+        address token
+    ) external view returns (
+        uint256 totalReward,
+        uint256 rewardRate,
+        uint256 periodFinish,
+        uint256 totalDistributed,
+        uint256 remainingRewards
+    ) {
         require(periodIndex <= MAX_PERIOD_INDEX, "Invalid period index");
         require(isRewardToken[token], "Token not accepted as reward");
-
+        
         RewardPool storage pool = rewardPools[periodIndex][token];
         uint256 remaining = IERC20Metadata(token).balanceOf(address(this)) - pool.totalDistributed;
-
+        
         return (
             pool.totalReward,
             pool.rewardRate,
@@ -749,18 +841,15 @@ contract AIXCBStaking is
     /// @param periodIndex Index of the staking period
     /// @param token Address of the reward token
     /// @return Annual Percentage Rate (scaled by PRECISION)
-    function getAPR(uint256 periodIndex, address token)
-        external
-        view
-        validPeriod(periodIndex)
-        validRewardToken(token)
-        returns (uint256)
-    {
+    function getAPR(uint256 periodIndex, address token) external view returns (uint256) {
+        require(periodIndex <= MAX_PERIOD_INDEX, "Invalid period index");
+        require(isRewardToken[token], "Token not accepted as reward");
+        
         RewardPool storage pool = rewardPools[periodIndex][token];
         uint256 totalStaked = totalStakedForPeriod[periodIndex];
-
+        
         if (totalStaked == 0) return 0;
-
+        
         // APR = (rewardRate * SECONDS_PER_YEAR * 100 * PRECISION) / totalStaked
         return (pool.rewardRate * SECONDS_PER_YEAR * 100 * PRECISION) / totalStaked;
     }
@@ -768,14 +857,14 @@ contract AIXCBStaking is
     /// @notice Removes a reward token from the contract
     /// @dev Only callable by admin role. Ensures all rewards are distributed before removal
     /// @param token Address of the reward token to remove
-    function removeRewardToken(address token)
-        external
-        onlyRole(ADMIN_ROLE)
-        whenNotPaused
-        nonReentrant
+    function removeRewardToken(address token) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+        whenNotPaused 
+        nonReentrant 
     {
         if (!isRewardToken[token]) revert TokenNotRewardToken();
-
+        
         // Check for pending rewards across all periods
         for (uint256 periodIndex = 0; periodIndex <= MAX_PERIOD_INDEX; periodIndex++) {
             RewardPool storage pool = rewardPools[periodIndex][token];
@@ -806,118 +895,17 @@ contract AIXCBStaking is
     /// @dev Only callable by admin role. Cannot recover staking token or active reward tokens
     /// @param tokenAddress Address of the token to recover
     /// @param tokenAmount Amount of tokens to recover
-    function recoverERC20(address tokenAddress, uint256 tokenAmount)
-        external
-        onlyRole(ADMIN_ROLE)
-        nonReentrant
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+        nonReentrant 
     {
         if (tokenAddress == address(stakingToken)) revert CannotRecoverStakingToken();
         if (isRewardToken[tokenAddress]) revert CannotRecoverRewardToken();
-
+        
         IERC20Metadata(tokenAddress).safeTransfer(treasury, tokenAmount);
-
+        
         emit Recovered(tokenAddress, tokenAmount, block.timestamp);
-    }
-
-    /// @notice Gets the amount staked by a user for a specific period
-    /// @param user Address of the user to check
-    /// @param periodIndex Index of the staking period
-    /// @return Amount of tokens staked by the user in the specified period
-    function getUserStakeForPeriod(
-        address user,
-        uint256 periodIndex
-    ) external view
-        validPeriod(periodIndex)
-        returns (uint256)
-    {
-        UserStake storage userStake = userStakes[user][periodIndex];
-        if (!userStake.initialized) return 0;
-        return userStake.amount;
-    }
-
-    /// @notice Checks if all reward pools for a given period have finished their distribution period
-    /// @param periodIndex Index of the staking period to check
-    /// @return bool True if all reward pools for the period have finished distribution
-    function isAllRewardPoolsFinished(uint256 periodIndex)
-        public
-        view
-        returns (bool)
-    {
-        for (uint256 i = 0; i < rewardTokens.length; i++) {
-            address token = rewardTokens[i];
-            RewardPool storage pool = rewardPools[periodIndex][token];
-            if (block.timestamp < pool.periodFinish) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// @notice Upgrades a user's stake to a longer lock period
-    /// @dev Claims all pending rewards from the current period before upgrading
-    /// @param currentPeriodIndex The current staking period index
-    /// @param newPeriodIndex The new staking period index to upgrade to
-    function upgradeStakePeriod(uint256 currentPeriodIndex, uint256 newPeriodIndex)
-        external
-        nonReentrant
-        whenNotPaused
-        notEmergency
-        validPeriod(currentPeriodIndex)
-        validPeriod(newPeriodIndex)
-    {
-        require(lockPeriods[newPeriodIndex] > lockPeriods[currentPeriodIndex],
-            "Can only upgrade to longer lock");
-
-        UserStake storage currentStake = userStakes[msg.sender][currentPeriodIndex];
-        if (!currentStake.initialized) revert StakeNotFound();
-
-        _updateReward(msg.sender, currentPeriodIndex);
-
-        _claimRewardsForPeriod(currentPeriodIndex);
-
-        uint256 amount = currentStake.amount;
-        uint256 newEndTime = block.timestamp + lockPeriods[newPeriodIndex];
-
-        totalStakedForPeriod[currentPeriodIndex] -= amount;
-        delete userStakes[msg.sender][currentPeriodIndex];
-
-        UserStake storage newStake = userStakes[msg.sender][newPeriodIndex];
-
-        if (newStake.initialized) {
-            newStake.amount += uint128(amount);
-        } else {
-            userStakes[msg.sender][newPeriodIndex] = UserStake({
-                amount: uint128(amount),
-                startTime: uint48(block.timestamp),
-                endTime: uint48(newEndTime),
-                periodIndex: uint32(newPeriodIndex),
-                initialized: true
-            });
-
-            if (!_hasStakedInPeriod[newPeriodIndex][msg.sender]) {
-                _stakersPerPeriod[newPeriodIndex].push(msg.sender);
-                _hasStakedInPeriod[newPeriodIndex][msg.sender] = true;
-            }
-        }
-
-        totalStakedForPeriod[newPeriodIndex] += amount;
-
-        emit StakeUpgraded(msg.sender, currentPeriodIndex, newPeriodIndex, amount, newEndTime);
-    }
-
-    /// @notice Internal function to claim rewards for a specific staking period
-    /// @dev Transfers all pending rewards to the user and emits RewardPaid events
-    /// @param periodIndex The staking period index to claim rewards from
-    function _claimRewardsForPeriod(uint256 periodIndex) internal {
-        for (uint256 i = 0; i < rewardTokens.length; i++) {
-            address token = rewardTokens[i];
-            uint256 reward = userRewards[msg.sender][periodIndex][token];
-            if (reward > 0) {
-                userRewards[msg.sender][periodIndex][token] = 0;
-                IERC20Metadata(token).safeTransfer(msg.sender, reward);
-                emit RewardPaid(msg.sender, token, reward, periodIndex);
-            }
-        }
     }
 
     uint256[50] private __gap;
